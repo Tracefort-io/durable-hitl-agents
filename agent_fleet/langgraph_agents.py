@@ -34,6 +34,7 @@ Determinism note: nodes that run inline in the workflow (``_act`` nodes, the con
 from __future__ import annotations
 
 import inspect
+import re
 from datetime import timedelta
 from typing import Annotated, Any, TypedDict
 
@@ -164,10 +165,14 @@ def _chat_model(tools: list | None = None):
 
     from langchain.chat_models import init_chat_model
 
-    from agent_fleet.config import DEFAULT_MODEL
+    from agent_fleet.config import DEFAULT_MODEL, LLM_MAX_RETRIES
 
     provider = os.environ.get("MODEL_PROVIDER", "google_genai")
-    model = init_chat_model(DEFAULT_MODEL, model_provider=provider)
+    # No client-side retries: the *_reason activity fails and Temporal retries it. The
+    # langchain-google-genai default (6) makes up to six tries inside one activity attempt.
+    # Its docs say 0 means "Google's default"; the pinned google-genai 1.75.0 reads 0 as one
+    # attempt (tests/test_workflows.py pins that).
+    model = init_chat_model(DEFAULT_MODEL, model_provider=provider, max_retries=LLM_MAX_RETRIES)
     return model.bind_tools(tools) if tools else model
 
 
@@ -196,6 +201,17 @@ def _last_text(messages: list | None) -> str:
         if text:
             return text
     return ""
+
+
+# A plain-text decision counts only when the reply LEADS with it ("HOLD — ...", "Decision: held").
+_LEADING_DECISION = re.compile(r"^\W*(?:decision\W*)?(hold|held|dispatch)\b", re.IGNORECASE)
+
+
+def _text_decision(text: str) -> str:
+    """HOLD or DISPATCH from a reply that didn't call submit_dispatch. A reply that only
+    mentions holding ("No need to hold — dispatch driver-a") stays DISPATCH."""
+    match = _LEADING_DECISION.match(text)
+    return "HOLD" if match and match.group(1).lower() in ("hold", "held") else "DISPATCH"
 
 
 def _node_summary(agent: str, phase: str) -> str:
@@ -529,7 +545,7 @@ async def dispatch_reason(state: TeamState) -> dict:
         if not text:
             ans = (state.get("dispatch_human_answer") or "").strip().lower()
             text = "HOLD" if ans == "reject" else "DISPATCH"
-        out["dispatch_decision"] = "HOLD" if "HOLD" in text.upper() else "DISPATCH"
+        out["dispatch_decision"] = _text_decision(text)
     # else: ask_human is in the tool calls → dispatch_route sends to dispatch_human
     return out
 
